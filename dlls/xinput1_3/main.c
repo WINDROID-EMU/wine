@@ -3,6 +3,7 @@
  * Copyright 2008 Andrew Fenn
  * Copyright 2018 Aric Stewart
  * Copyright 2021 Rémi Bernon for CodeWeavers
+ * Copyright 2025 Pablo Labs
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -48,7 +49,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47
 /* Not defined in the headers, used only by XInputGetStateEx */
 #define XINPUT_GAMEPAD_GUIDE 0x0400
 
-#define BUFFER_SIZE 64
+#define CONTROLLER_BUFFER_SIZE 32
+#define BUFFER_SIZE (CONTROLLER_BUFFER_SIZE * 4)
 #define SERVER_PORT 7941
 
 #define REQUEST_GET_CONNECTION 1
@@ -107,19 +109,6 @@ static HMODULE xinput_instance;
 static HANDLE start_event;
 static HANDLE update_event;
 
-static BOOL find_opened_device(const WCHAR *device_path, int *free_slot)
-{
-    int i;
-
-    *free_slot = XUSER_MAX_COUNT;
-    for (i = XUSER_MAX_COUNT; i > 0; i--)
-    {
-        if (!controllers[i - 1].device) *free_slot = i - 1;
-        else if (!wcsicmp(device_path, controllers[i - 1].device_path)) return TRUE;
-    }
-    return FALSE;
-}
-
 static BOOL controller_check_caps(struct xinput_controller *controller)
 {
     XINPUT_CAPABILITIES *caps = &controller->caps;
@@ -147,12 +136,9 @@ static BOOL controller_check_caps(struct xinput_controller *controller)
     return TRUE;
 }
 
-static void controller_destroy(struct xinput_controller *controller, BOOL already_removed);
-
 static void controller_enable(struct xinput_controller *controller)
 {
     if (controller->enabled) return;
-
     controller->enabled = TRUE;
 
     SetEvent(update_event);
@@ -166,126 +152,27 @@ static void controller_disable(struct xinput_controller *controller)
     SetEvent(update_event);
 }
 
-static BOOL controller_init(struct xinput_controller *controller)
+static void controller_connect(struct xinput_controller *controller)
 {
-    memset(&controller->state, 0, sizeof(controller->state));
+    EnterCriticalSection(&controller->crit);
 
-    /*
-    memset(&controller->vibration, 0, sizeof(controller->vibration));
-    */
+    memset(&controller->state, 0, sizeof(controller->state));
 
     controller_check_caps(controller);
     controller->connected = TRUE;
     controller->enabled = TRUE;
-    return TRUE;
+
+    LeaveCriticalSection(&controller->crit);
 }
 
-static void get_registry_keys(HKEY *defkey, HKEY *appkey)
-{
-    WCHAR buffer[MAX_PATH + 26], *name = buffer, *tmp;
-    DWORD len;
-    HKEY hkey;
-
-    *appkey = 0;
-    if (RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\DirectInput\\Joysticks", defkey))
-        *defkey = 0;
-
-    if (!(len = GetModuleFileNameW(0, buffer, MAX_PATH)) || len >= MAX_PATH)
-        return;
-
-    if (!RegOpenKeyW(HKEY_CURRENT_USER, L"Software\\Wine\\AppDefaults", &hkey))
-    {
-        if ((tmp = wcsrchr(name, '/'))) name = tmp + 1;
-        if ((tmp = wcsrchr(name, '\\'))) name = tmp + 1;
-        wcscat(name, L"\\DirectInput\\Joysticks");
-        if (RegOpenKeyW(hkey, name, appkey)) *appkey = 0;
-        RegCloseKey(hkey);
-    }
-}
-
-static BOOL device_is_overridden(HANDLE device)
-{
-    WCHAR name[MAX_PATH], buffer[MAX_PATH];
-    DWORD size = sizeof(buffer);
-    BOOL disable = FALSE;
-    HKEY defkey, appkey;
-
-    get_registry_keys(&defkey, &appkey);
-    if (!defkey && !appkey) return FALSE;
-    if ((appkey && !RegQueryValueExW(appkey, name, 0, NULL, (LPBYTE)buffer, &size)) ||
-        (defkey && !RegQueryValueExW(defkey, name, 0, NULL, (LPBYTE)buffer, &size)))
-    {
-        if ((disable = !wcscmp(buffer, L"override")))
-            TRACE("Disabling gamepad '%s' based on registry key.\n", debugstr_w(name));
-    }
-
-    if (appkey) RegCloseKey(appkey);
-    if (defkey) RegCloseKey(defkey);
-    return disable;
-}
-
-static BOOL try_add_device(const WCHAR *device_path)
-{
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
-    NTSTATUS status;
-    HANDLE device;
-    int i;
-
-    if (find_opened_device(device_path, &i)) return TRUE; /* already opened */
-    if (i == XUSER_MAX_COUNT) return FALSE; /* no more slots */
-
-    device = CreateFileW(device_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
-    if (device == INVALID_HANDLE_VALUE) return TRUE;
-
-    CloseHandle(device);
-    return TRUE;
-}
-
-static void try_remove_device(const WCHAR *device_path)
-{
-    int i;
-
-    if (find_opened_device(device_path, &i))
-        controller_destroy(&controllers[i], TRUE);
-}
-
-static void update_controller_list(void)
-{
-    char buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + MAX_PATH * sizeof(WCHAR)];
-    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
-    HDEVINFO set;
-    DWORD idx;
-    GUID guid;
-
-    guid = GUID_DEVINTERFACE_WINEXINPUT;
-
-    set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
-    detail->cbSize = sizeof(*detail);
-
-    idx = 0;
-    while (SetupDiEnumDeviceInterfaces(set, NULL, &guid, idx++, &iface))
-    {
-        if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL))
-            continue;
-        if (!try_add_device(detail->DevicePath))
-            break;
-    }
-
-    SetupDiDestroyDeviceInfoList(set);
-}
-
-static void controller_destroy(struct xinput_controller *controller, BOOL already_removed)
+static void controller_disconnect(struct xinput_controller *controller)
 {
     EnterCriticalSection(&controller->crit);
 
-    if (controller->device)
-    {
-        if (!already_removed) controller_disable(controller);
-        CloseHandle(controller->device);
-        controller->device = NULL;
-    }
+    controller->connected = FALSE;
+    controller->enabled = FALSE;
+
+    memset(&controller->caps, 0, sizeof(controller->caps));
 
     LeaveCriticalSection(&controller->crit);
 }
@@ -297,41 +184,72 @@ static short scale_value(unsigned short input)
 
 static void read_controller_state(struct xinput_controller *controller, char *buffer)
 {
+    /*
+        Received Buffer Scheme
+
+        buffer[0]: Type of operation
+        buffer[1]: Controller Connected Status
+        buffer[2]: A Button State
+        buffer[3]: B Button State
+        buffer[4]: X Button State
+        buffer[5]: Y Button State
+        buffer[6]: LB Button State
+        buffer[7]: RB Button State
+        buffer[8]: Back Button State
+        buffer[9]: Start Button State
+        buffer[10]: LS Button State
+        buffer[11]: RS Button State
+        buffer[12]: Guide Button State
+        buffer[13]: D-Pad Status
+        buffer[14-16]: Left X Analog Status (0-255)
+        buffer[17-19]: Left Y Analog Status (0-255)
+        buffer[20-22]: Right X Analog Status (0-255)
+        buffer[23-25]: Right Y Analog Status (0-255)
+        buffer[26-28]: LT Status (0-255)
+        buffer[29-31]: RT Status (0-255)
+    */
+
     XINPUT_STATE *state = &controller->state;
+    short thumbLX;
+    short thumbLY;
+    short thumbRX;
+    short thumbRY;
+    short rightTrigger;
+    short leftTrigger;
 
     state->Gamepad.wButtons = 0;
 
-    if (buffer[1]) {
+    if (buffer[2]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_A;
     }
-    if (buffer[2]) {
+    if (buffer[3]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_B;
     }
-    if (buffer[3]) {
+    if (buffer[4]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_X;
     }
-    if (buffer[4]) {
+    if (buffer[5]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
     }
-    if (buffer[5]) {
+    if (buffer[6]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     }
-    if (buffer[6]) {
+    if (buffer[7]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     }
-    if (buffer[7]) {
+    if (buffer[8]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_BACK;
     }
-    if (buffer[8]) {
+    if (buffer[9]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_START;
     }
-    if (buffer[9]) {
+    if (buffer[10]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
     }
-    if (buffer[10]) {
+    if (buffer[11]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     }
-    if (buffer[11]) {
+    if (buffer[12]) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_GUIDE;
     }
 
@@ -339,7 +257,7 @@ static void read_controller_state(struct xinput_controller *controller, char *bu
      * 7 0 3
      * 6 5 4 */
 
-    switch (buffer[12])
+    switch (buffer[13])
     {
         case 0: break;
         case 1: state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP; break;
@@ -352,39 +270,27 @@ static void read_controller_state(struct xinput_controller *controller, char *bu
         case 8: state->Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP; break;
     }
 
-    short thumbLX = scale_value((buffer[13] * 100) + (buffer[14] * 10) + (buffer[15]));
-    short thumbLY = scale_value((buffer[16] * 100) + (buffer[17] * 10) + (buffer[18]));
-    short thumbRX = scale_value((buffer[19] * 100) + (buffer[20] * 10) + (buffer[21]));
-    short thumbRY = scale_value((buffer[22] * 100) + (buffer[23] * 10) + (buffer[24]));
-
-    short rightTrigger = (buffer[28] * 100) + (buffer[29] * 10) + (buffer[30]);
-    short leftTrigger = (buffer[25] * 100) + (buffer[26] * 10) + (buffer[27]);
+    thumbLX = scale_value((buffer[14] * 100) + (buffer[15] * 10) + (buffer[16]));
+    thumbLY = scale_value((buffer[17] * 100) + (buffer[18] * 10) + (buffer[19]));
+    thumbRX = scale_value((buffer[20] * 100) + (buffer[21] * 10) + (buffer[22]));
+    thumbRY = scale_value((buffer[23] * 100) + (buffer[24] * 10) + (buffer[25]));
 
     state->Gamepad.sThumbLX = thumbLX;
     state->Gamepad.sThumbLY = thumbLY;
     state->Gamepad.sThumbRX = thumbRX;
     state->Gamepad.sThumbRY = thumbRY;
 
+    leftTrigger = (buffer[26] * 100) + (buffer[27] * 10) + (buffer[28]);
+    rightTrigger = (buffer[29] * 100) + (buffer[30] * 10) + (buffer[31]);
+
     state->Gamepad.bRightTrigger = rightTrigger;
     state->Gamepad.bLeftTrigger = leftTrigger;
 
     EnterCriticalSection(&controller->crit);
-    
+
     state->dwPacketNumber++;
-    
+
     LeaveCriticalSection(&controller->crit);
-}
-
-static LRESULT CALLBACK xinput_devnotify_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
-{
-    if (msg == WM_DEVICECHANGE)
-    {
-        DEV_BROADCAST_DEVICEINTERFACE_W *iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)lparam;
-        if (wparam == DBT_DEVICEARRIVAL) try_add_device(iface->dbcc_name);
-        if (wparam == DBT_DEVICEREMOVECOMPLETE) try_remove_device(iface->dbcc_name);
-    }
-
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
 static DWORD WINAPI gamepad_update_thread_proc(void *param)
@@ -393,6 +299,10 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     SOCKET serverSocket;
     struct sockaddr_in serverAddr;
     char buffer[BUFFER_SIZE];
+    char controller0[CONTROLLER_BUFFER_SIZE];
+    char controller1[CONTROLLER_BUFFER_SIZE];
+    char controller2[CONTROLLER_BUFFER_SIZE];
+    char controller3[CONTROLLER_BUFFER_SIZE];
     int serverAddrSize = sizeof(serverAddr);
     int res = -1;
 
@@ -421,11 +331,8 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     {
         memset(buffer, 0, BUFFER_SIZE);
 
-        if (controllers[0].connected) {
-            memset(buffer, 0, BUFFER_SIZE);
-            buffer[0] = REQUEST_GET_CONTROLLER_STATE;
-            sendto(serverSocket, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, serverAddrSize);
-        }
+        buffer[0] = REQUEST_GET_CONTROLLER_STATE;
+        sendto(serverSocket, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, serverAddrSize);
 
         res = recvfrom(serverSocket, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, &serverAddrSize);
         if (res < 0) {
@@ -435,17 +342,43 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
 
         switch (buffer[0]) {
             case REQUEST_GET_CONNECTION:
-                EnterCriticalSection(&controllers[0].crit);
-                
-                controller_init(&controllers[0]);
-
-                LeaveCriticalSection(&controllers[0].crit);
-
-                SetEvent(start_event); 
+                SetEvent(start_event);
                 break;
-            
+
             case REQUEST_GET_CONTROLLER_STATE:
-                read_controller_state(&controllers[0], buffer);
+                memcpy(controller0, buffer, 32);
+                memcpy(controller1, buffer + 32, 32);
+                memcpy(controller2, buffer + 32 * 2, 32);
+                memcpy(controller3, buffer + 32 * 3, 32);
+
+                if (controller0[1]) {
+                    controller_connect(&controllers[0]);
+                    read_controller_state(&controllers[0], controller0);
+                } else {
+                    controller_disconnect(&controllers[0]);
+                }
+
+                if (controller1[1]) {
+                    controller_connect(&controllers[1]);
+                    read_controller_state(&controllers[1], controller1);
+                } else {
+                    controller_disconnect(&controllers[1]);
+                }
+
+                if (controller2[1]) {
+                    controller_connect(&controllers[2]);
+                    read_controller_state(&controllers[2], controller2);
+                } else {
+                    controller_disconnect(&controllers[2]);
+                }
+
+                if (controller3[1]) {
+                    controller_connect(&controllers[3]);
+                    read_controller_state(&controllers[3], controller3);
+                } else {
+                    controller_disconnect(&controllers[3]);
+                }
+
                 break;
         }
     }
@@ -816,8 +749,9 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
 
     start_update_thread();
 
-    /* For now report one controller */
-    if (index > 0) return ERROR_BAD_ARGUMENTS;
+    if (!controllers[index].connected) {
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
 
     EnterCriticalSection(&controllers[index].crit);
 
