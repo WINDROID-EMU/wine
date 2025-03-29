@@ -352,28 +352,36 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
                 memcpy(controller3, buffer + 32 * 3, 32);
 
                 if (controller0[1]) {
-                    controller_connect(&controllers[0]);
+                    if (!controllers[0].connected) {
+                        controller_connect(&controllers[0]);
+                    }
                     read_controller_state(&controllers[0], controller0);
                 } else {
                     controller_disconnect(&controllers[0]);
                 }
 
                 if (controller1[1]) {
-                    controller_connect(&controllers[1]);
+                    if (!controllers[1].connected) {
+                        controller_connect(&controllers[1]);
+                    }
                     read_controller_state(&controllers[1], controller1);
                 } else {
                     controller_disconnect(&controllers[1]);
                 }
 
                 if (controller2[1]) {
-                    controller_connect(&controllers[2]);
+                    if (!controllers[2].connected) {
+                        controller_connect(&controllers[2]);
+                    }
                     read_controller_state(&controllers[2], controller2);
                 } else {
                     controller_disconnect(&controllers[2]);
                 }
 
                 if (controller3[1]) {
-                    controller_connect(&controllers[3]);
+                    if (!controllers[3].connected) {
+                        controller_connect(&controllers[3]);
+                    }
                     read_controller_state(&controllers[3], controller3);
                 } else {
                     controller_disconnect(&controllers[3]);
