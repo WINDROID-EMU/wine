@@ -2095,7 +2095,7 @@ HWND WINAPI NtUserSetActiveWindow( HWND hwnd )
  */
 HWND WINAPI NtUserSetFocus( HWND hwnd )
 {
-    HWND hwndTop = hwnd;
+    HWND hwndTop = hwnd, active;
     HWND previous = get_focus();
 
     TRACE( "%p prev %p\n", hwnd, previous );
@@ -2130,7 +2130,8 @@ HWND WINAPI NtUserSetFocus( HWND hwnd )
         if (call_hooks( WH_CBT, HCBT_SETFOCUS, (WPARAM)hwnd, (LPARAM)previous, 0 )) return 0;
 
         /* activate hwndTop if needed. */
-        if (hwndTop != get_active_window())
+        if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE )) return 0;
+        if (hwndTop != active)
         {
             if (!set_active_window( hwndTop, NULL, FALSE, FALSE, 0 )) return 0;
             if (!is_window( hwnd )) return 0;  /* Abort if window destroyed */
