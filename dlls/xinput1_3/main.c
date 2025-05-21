@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -57,6 +58,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47
 #define REQUEST_GET_CONTROLLER_STATE 2
 
 WINE_DEFAULT_DEBUG_CHANNEL(xinput);
+
+static bool xinput_is_ready = false;
 
 struct xinput_controller
 {
@@ -127,7 +130,7 @@ static BOOL controller_check_caps(struct xinput_controller *controller)
     caps->Type = XINPUT_DEVTYPE_GAMEPAD;
     caps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
 
-    /* TODO -> Rumble Support
+    /* W.I.P -> Rumble Support
     caps->Flags |= XINPUT_CAPS_FFB_SUPPORTED;
     caps->Vibration.wLeftMotorSpeed = 255;
     caps->Vibration.wRightMotorSpeed = 255;
@@ -305,6 +308,7 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     char controller3[CONTROLLER_BUFFER_SIZE];
     int serverAddrSize = sizeof(serverAddr);
     int res = -1;
+    int timeoutCounter = 0;
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         printf("Fail on start WSA.\n");
@@ -322,6 +326,14 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
     serverAddr.sin_port = htons(SERVER_PORT);
 
+    struct timeval timeout;
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) < 0) {
+        printf("Failure on defining timeout on server: %d\n", WSAGetLastError());
+    }
+
     memset(buffer, 0, BUFFER_SIZE);
     buffer[0] = REQUEST_GET_CONNECTION;
 
@@ -334,11 +346,30 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
         buffer[0] = REQUEST_GET_CONTROLLER_STATE;
         sendto(serverSocket, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, serverAddrSize);
 
+        memset(buffer, 0, BUFFER_SIZE);
+        serverAddrSize = sizeof(serverAddr);
         res = recvfrom(serverSocket, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&serverAddr, &serverAddrSize);
-        if (res < 0) {
-            ERR("Failed to receive request.\n");
-            return 0;
+
+        if (res == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT) {
+                timeoutCounter++;
+                if (timeoutCounter > 60) {
+                    TRACE("Failed to retrieve connection from input server...\n");
+                    for (int i = 0; i < 4; i++) {
+                        if (controllers[i].connected) {
+                            controller_disconnect(&controllers[i]);
+                        }
+                    }
+                    xinput_is_ready = true; // For not locking thread of xinput_get_state or XInputGetCapabilitiesEx
+                    timeoutCounter = 0;
+                    Sleep(250);
+                    xinput_is_ready = false;
+                }
+            }
+            continue;
         }
+        timeoutCounter = 0;
 
         switch (buffer[0]) {
             case REQUEST_GET_CONNECTION:
@@ -351,42 +382,21 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
                 memcpy(controller2, buffer + 32 * 2, 32);
                 memcpy(controller3, buffer + 32 * 3, 32);
 
-                if (controller0[1]) {
-                    if (!controllers[0].connected) {
-                        controller_connect(&controllers[0]);
-                    }
-                    read_controller_state(&controllers[0], controller0);
-                } else {
-                    controller_disconnect(&controllers[0]);
-                }
+                char *controllers_ptrs[4] = { controller0, controller1, controller2, controller3 };
 
-                if (controller1[1]) {
-                    if (!controllers[1].connected) {
-                        controller_connect(&controllers[1]);
+                for (int i = 0; i < 4; i++) {
+                    if (controllers_ptrs[i][1]) {
+                        if (!controllers[i].connected) {
+                            controller_connect(&controllers[i]);
+                        }
+                        read_controller_state(&controllers[i], controllers_ptrs[i]);
+                    } else {
+                        if (controllers[i].connected) {
+                            controller_disconnect(&controllers[i]);
+                        }
                     }
-                    read_controller_state(&controllers[1], controller1);
-                } else {
-                    controller_disconnect(&controllers[1]);
                 }
-
-                if (controller2[1]) {
-                    if (!controllers[2].connected) {
-                        controller_connect(&controllers[2]);
-                    }
-                    read_controller_state(&controllers[2], controller2);
-                } else {
-                    controller_disconnect(&controllers[2]);
-                }
-
-                if (controller3[1]) {
-                    if (!controllers[3].connected) {
-                        controller_connect(&controllers[3]);
-                    }
-                    read_controller_state(&controllers[3], controller3);
-                } else {
-                    controller_disconnect(&controllers[3]);
-                }
-
+                xinput_is_ready = true;
                 break;
         }
     }
@@ -476,7 +486,9 @@ static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
     start_update_thread();
 
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
-    if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
+
+    while (!xinput_is_ready) Sleep(125);
+    if (!controllers[index].connected) return ERROR_DEVICE_NOT_CONNECTED;
 
     *state = controllers[index].state;
 
@@ -756,6 +768,8 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
     TRACE("unk %lu, index %lu, flags %#lx, capabilities %p.\n", unk, index, flags, caps);
 
     start_update_thread();
+
+    while (!xinput_is_ready) Sleep(125);
 
     if (!controllers[index].connected) {
         return ERROR_DEVICE_NOT_CONNECTED;
