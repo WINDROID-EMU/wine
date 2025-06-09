@@ -110,7 +110,6 @@ static struct xinput_controller controllers[XUSER_MAX_COUNT] =
 
 static HMODULE xinput_instance;
 static HANDLE start_event;
-static HANDLE update_event;
 
 static BOOL controller_check_caps(struct xinput_controller *controller)
 {
@@ -143,16 +142,12 @@ static void controller_enable(struct xinput_controller *controller)
 {
     if (controller->enabled) return;
     controller->enabled = TRUE;
-
-    SetEvent(update_event);
 }
 
 static void controller_disable(struct xinput_controller *controller)
 {
     if (!controller->enabled) return;
     controller->enabled = FALSE;
-
-    SetEvent(update_event);
 }
 
 static void controller_connect(struct xinput_controller *controller)
@@ -301,6 +296,9 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     WSADATA wsaData;
     SOCKET serverSocket;
     struct sockaddr_in serverAddr;
+    struct timeval timeout;
+    const char *env = getenv("MICEWINE_JOYSTICK_SERVER_IP");
+    const char *serverIp = env ? env : "127.0.0.1";
     char buffer[BUFFER_SIZE];
     char controller0[CONTROLLER_BUFFER_SIZE];
     char controller1[CONTROLLER_BUFFER_SIZE];
@@ -323,10 +321,9 @@ static DWORD WINAPI gamepad_update_thread_proc(void *param)
     }
 
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serverAddr.sin_addr.s_addr = inet_addr(serverIp);
     serverAddr.sin_port = htons(SERVER_PORT);
 
-    struct timeval timeout;
     timeout.tv_sec = 2;
     timeout.tv_usec = 0;
 
@@ -408,9 +405,6 @@ static BOOL WINAPI start_update_thread_once( INIT_ONCE *once, void *param, void 
 
     start_event = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (!start_event) ERR("failed to create start event, error %lu\n", GetLastError());
-
-    update_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (!update_event) ERR("failed to create update event, error %lu\n", GetLastError());
 
     thread = CreateThread(NULL, 0, gamepad_update_thread_proc, NULL, 0, NULL);
     if (!thread) ERR("failed to create update thread, error %lu\n", GetLastError());
